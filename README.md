@@ -1,6 +1,6 @@
-# Bipartite graph randomization using BiReWire
+# Bipartite graph randomization in Python using BiReWire
 
-This repository contains code to generate random bipartite network graphs by rewiring existing community graph structures while preserving degree distributions. It uses the BiRewire R package through rpy2 to perform statistically rigorous network randomization.
+This repository contains code to generate random bipartite network graphs by rewiring existing graph structures while preserving degree distributions. It uses the BiRewire R package through rpy2 to perform statistically rigorous network randomization.
 
 ## Overview
 
