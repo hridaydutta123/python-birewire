@@ -1,164 +1,159 @@
 import os
-import argparse
 import networkx as nx
 import numpy as np
 from tqdm import tqdm
+import rpy2.robjects as ro
 
-from rpy2.robjects import pandas2ri, numpy2ri
-import rpy2.robjects as robjects
-from rpy2.robjects.packages import importr
+# ---------- Load BiRewire ----------
+ro.r("""
+if (!requireNamespace("BiRewire", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager", repos="https://cloud.r-project.org")
+    }
+    BiocManager::install("BiRewire", ask = FALSE)
+}
+library(BiRewire)
+""")
+
+# Probe the return structure once so we know how to extract the matrix
+ro.r("""
+.birewire_returns_list <- tryCatch({
+    m <- matrix(c(1L,0L,1L,1L,0L,1L,1L,0L,1L,1L,0L,1L), nrow=3L, ncol=4L)
+    r <- birewire.rewire.bipartite(m)
+    is.list(r)
+}, error = function(e) FALSE)
+""")
+returns_list = bool(ro.r(".birewire_returns_list")[0])
+print(f"birewire.rewire.bipartite returns list: {returns_list}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Rewire bipartite graphs using BiRewire"
+def extract_newmatrix(rewired, nrow, ncol):
+    """Extract the rewired matrix regardless of return type."""
+    if returns_list:
+        # Named list: result$newmatrix
+        new_mat_r = rewired.rx2("newmatrix")
+    else:
+        # Already the matrix itself
+        new_mat_r = rewired
+    flat = list(new_mat_r)
+    return np.array(flat, dtype=np.int32).reshape((nrow, ncol), order="F")
+
+
+def rewire_matrix(mat_np, n=100):
+    nrow, ncol = mat_np.shape
+    mat_int = mat_np.astype(np.int32)
+
+    r_mat = ro.r["matrix"](
+        ro.IntVector(mat_int.flatten(order="F").tolist()),
+        nrow=nrow,
+        ncol=ncol,
     )
 
-    parser.add_argument("--input_dir", required=True)
-    parser.add_argument("--output_dir", required=True)
+    results = []
+    attempts = 0
+    max_attempts = n * 20
 
-    parser.add_argument(
-        "--num_rewires",
-        type=int,
-        default=1000
-    )
+    while len(results) < n and attempts < max_attempts:
+        attempts += 1
+        try:
+            rewired = ro.r["birewire.rewire.bipartite"](r_mat)
+            mat_out = extract_newmatrix(rewired, nrow, ncol)
+            results.append(mat_out)
+        except Exception as e:
+            if attempts == 1:
+                # Print once to show the actual structure
+                print(f"  rewire failed, probing return type: {e}")
+                try:
+                    rewired = ro.r["birewire.rewire.bipartite"](r_mat)
+                    print(f"  return type: {type(rewired)}, len: {len(rewired)}")
+                    try:
+                        print(f"  names: {list(rewired.names)}")
+                    except Exception:
+                        pass
+                except Exception as e2:
+                    print(f"  probe also failed: {e2}")
+            continue
 
-    parser.add_argument(
-        "--bipartite_attr",
-        default="bipartite"
-    )
+    return results
 
-    return parser.parse_args()
+
+def graph_to_matrix(G):
+    top_nodes = sorted([n for n, d in G.nodes(data=True) if d.get("bipartite") == 0])
+    bottom_nodes = sorted([n for n, d in G.nodes(data=True) if d.get("bipartite") == 1])
+    mat = nx.bipartite.biadjacency_matrix(G, row_order=top_nodes, column_order=bottom_nodes)
+    return mat.toarray().astype(np.int32), top_nodes, bottom_nodes
+
+
+def matrix_to_graph(mat, top_nodes, bottom_nodes):
+    G = nx.Graph()
+    for n in top_nodes:
+        G.add_node(n, bipartite=0)
+    for n in bottom_nodes:
+        G.add_node(n, bipartite=1)
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            if mat[i, j] > 0:
+                G.add_edge(top_nodes[i], bottom_nodes[j])
+    return G
+
+
+def process_graph(gml_path, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    existing = [f for f in os.listdir(output_dir) if f.endswith(".gml")]
+    if len(existing) >= 100:
+        print(f"  skipping {output_dir}, already complete")
+        return
+
+    G = nx.read_gml(gml_path)
+    mat_np, top_nodes, bottom_nodes = graph_to_matrix(G)
+
+    print(f"  matrix {mat_np.shape}, sum={mat_np.sum()}, "
+          f"top={len(top_nodes)}, bottom={len(bottom_nodes)}")
+
+    if mat_np.sum() == 0:
+        print("  skipping: empty matrix")
+        return
+
+    rewired_mats = rewire_matrix(mat_np, n=100)
+    print(f"  got {len(rewired_mats)} rewired matrices")
+
+    for i, mat_r in enumerate(rewired_mats):
+        G_new = matrix_to_graph(mat_r, top_nodes, bottom_nodes)
+        nx.write_gml(G_new, os.path.join(output_dir, f"random_{i}.gml"))
+
+    print(f"  saved {len(rewired_mats)} files to {output_dir}")
 
 
 def main():
+    input_root = "input_graphs"
+    output_root = "rewired_graphs"
 
-    args = parse_args()
+    if not os.path.isdir(input_root):
+        print(f"ERROR: input directory '{input_root}' not found")
+        return
 
-    input_dir = args.input_dir
-    output_dir = args.output_dir
-    NUM_REWIRES = args.num_rewires
-    bip_attr = args.bipartite_attr
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    pandas2ri.activate()
-    numpy2ri.activate()
-
-    print("Loading BiRewire...")
-    birewire = importr("BiRewire")
-    print("BiRewire loaded\n")
-
-    # Find all graph folders
-    graph_dirs = [
-        d for d in os.listdir(input_dir)
-        if os.path.isdir(os.path.join(input_dir, d))
-    ]
-
-    print(f"Found {len(graph_dirs)} graph directories\n")
-
-    for idx, graph_dir in enumerate(graph_dirs):
-
-        graph_path = os.path.join(
-            input_dir,
-            graph_dir,
-            "bipartite_graph.gml"
-        )
-
-        if not os.path.exists(graph_path):
-            print(f"Skipping {graph_dir} (no bipartite_graph.gml)")
+    dirs = sorted(os.listdir(input_root))
+    to_process = []
+    for d in dirs:
+        input_dir = os.path.join(input_root, d)
+        if not os.path.isdir(input_dir):
             continue
-
-        print(f"\n[{idx+1}/{len(graph_dirs)}] Processing {graph_dir}")
-
-        output_subdir = os.path.join(output_dir, graph_dir)
-        os.makedirs(output_subdir, exist_ok=True)
-
-        existing = [
-            f for f in os.listdir(output_subdir)
-            if f.startswith("random_")
-        ]
-
-        if len(existing) >= NUM_REWIRES:
-            print("Already completed — skipping")
+        gml_path = os.path.join(input_dir, "bipartite_graph.gml")
+        if not os.path.exists(gml_path):
+            print(f"  no bipartite_graph.gml in {input_dir}, skipping")
             continue
+        to_process.append((d, gml_path))
 
-        G = nx.read_gml(graph_path)
+    print(f"Found {len(to_process)} graphs to process")
 
-        bipartite_dict = nx.get_node_attributes(G, bip_attr)
-
-        # Remove intra-layer edges
-        G.remove_edges_from([
-            (u, v) for u, v in G.edges()
-            if bipartite_dict.get(u) == bipartite_dict.get(v)
-        ])
-
-        # Remove zero degree nodes
-        G.remove_nodes_from([n for n, d in G.degree() if d == 0])
-
-        # Split sets
-        top_nodes = {n for n, d in G.nodes(data=True) if d.get(bip_attr) == 0}
-        bottom_nodes = set(G.nodes()) - top_nodes
-
-        print(f"Nodes: {len(top_nodes)} top | {len(bottom_nodes)} bottom")
-
-        top_list = list(top_nodes)
-        bottom_list = list(bottom_nodes)
-
-        top_index = {n: i for i, n in enumerate(top_list)}
-        bottom_index = {n: i for i, n in enumerate(bottom_list)}
-
-        adj_np = np.zeros((len(top_list), len(bottom_list)), dtype=int)
-
-        for u, v in G.edges():
-
-            if u in top_nodes:
-                adj_np[top_index[u], bottom_index[v]] = 1
-            else:
-                adj_np[top_index[v], bottom_index[u]] = 1
-
-        robjects.globalenv["adj_matrix"] = numpy2ri.py2rpy(adj_np)
-
-        for i in tqdm(range(len(existing), NUM_REWIRES), desc="Rewiring"):
-
-            robjects.r(
-                "rewired_matrix <- birewire.rewire.bipartite(adj_matrix)"
-            )
-
-            rewired_np = numpy2ri.rpy2py(
-                robjects.r["rewired_matrix"]
-            )
-
-            rewired_graph = nx.Graph()
-
-            for ti, u in enumerate(top_list):
-                for bi, v in enumerate(bottom_list):
-
-                    if rewired_np[ti, bi] == 1:
-                        rewired_graph.add_edge(u, v)
-
-            nx.set_node_attributes(
-                rewired_graph,
-                {n: 0 for n in top_list},
-                bip_attr
-            )
-
-            nx.set_node_attributes(
-                rewired_graph,
-                {n: 1 for n in bottom_list},
-                bip_attr
-            )
-
-            output_file = os.path.join(
-                output_subdir,
-                f"random_{i}.gml"
-            )
-
-            nx.write_gml(rewired_graph, output_file)
-
-        print(f"Finished {graph_dir}")
-
-    print("\nAll graphs completed")
+    for d, gml_path in tqdm(to_process):
+        print(f"\nProcessing: {d}")
+        output_dir = os.path.join(output_root, d)
+        try:
+            process_graph(gml_path, output_dir)
+        except Exception as e:
+            print(f"  ERROR processing {d}: {e}")
 
 
 if __name__ == "__main__":
